@@ -48,7 +48,10 @@ fn main() {
     let mut copied = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+        {
             match std::fs::copy(&path, exe_dir.join(entry.file_name())) {
                 Ok(_) => copied.push(entry.file_name().to_string_lossy().into_owned()),
                 Err(e) => println!(
@@ -86,6 +89,12 @@ fn exe_dir_from_out_dir(out_dir: &Path) -> Option<&Path> {
 fn finds_exe_dir_in_both_cargo_layouts() {
     let old = Path::new("/p/target/release/build/liteview-0123abcd/out");
     let new = Path::new("/p/target/release/build/liteview/0123abcd/out");
-    assert_eq!(exe_dir_from_out_dir(old), Some(Path::new("/p/target/release")));
-    assert_eq!(exe_dir_from_out_dir(new), Some(Path::new("/p/target/release")));
+    assert_eq!(
+        exe_dir_from_out_dir(old),
+        Some(Path::new("/p/target/release"))
+    );
+    assert_eq!(
+        exe_dir_from_out_dir(new),
+        Some(Path::new("/p/target/release"))
+    );
 }

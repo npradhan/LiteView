@@ -50,6 +50,17 @@ pub fn decode_full(bytes: &[u8], file_name: &str) -> Result<Decoded, String> {
     })
 }
 
+/// Whether the bytes are a GIF with more than one frame. Decodes at most two frames.
+pub fn is_animated_gif(bytes: &[u8]) -> bool {
+    if image::guess_format(bytes).ok() != Some(ImageFormat::Gif) {
+        return false;
+    }
+    match image::codecs::gif::GifDecoder::new(Cursor::new(bytes)) {
+        Ok(dec) => dec.into_frames().take(2).filter(|f| f.is_ok()).count() == 2,
+        Err(_) => false,
+    }
+}
+
 /// Decode only the first frame and shrink it to fit within `max_side`.
 pub fn decode_thumbnail(
     bytes: &[u8],
@@ -222,6 +233,7 @@ mod tests {
             (ImageFormat::WebP, "a.webp"),
         ] {
             let bytes = encode(&img, fmt);
+            assert!(!is_animated_gif(&bytes), "{name} is not an animated GIF");
             let d = decode_full(&bytes, name).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(d.original_size, [40, 30], "{name}");
             assert_eq!(d.frames.len(), 1);
@@ -246,6 +258,7 @@ mod tests {
             });
             enc.encode_frames(frames).unwrap();
         }
+        assert!(is_animated_gif(&buf));
         let d = decode_full(&buf, "x.gif").unwrap();
         assert_eq!(d.frames.len(), 3);
         assert_eq!(d.frames[0].delay, Duration::from_millis(50));

@@ -38,7 +38,8 @@ const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
 enum Thumb {
     NotRequested,
     Pending,
-    Ready(TextureHandle),
+    /// The texture, and whether the page is an animated GIF.
+    Ready(TextureHandle, bool),
     Failed,
 }
 
@@ -199,14 +200,17 @@ impl LiteView {
                     };
                     self.cache.insert(index, slot);
                 }
-                Output::Thumb { index, result } => {
+                Output::Thumb {
+                    index,
+                    result,
+                    animated_gif,
+                } => {
                     if let Some(t) = self.thumbs.get_mut(index) {
                         *t = match result {
-                            Ok(img) => Thumb::Ready(ctx.load_texture(
-                                format!("thumb-{index}"),
-                                img,
-                                TEXTURE_OPTIONS,
-                            )),
+                            Ok(img) => Thumb::Ready(
+                                ctx.load_texture(format!("thumb-{index}"), img, TEXTURE_OPTIONS),
+                                animated_gif,
+                            ),
                             Err(_) => Thumb::Failed,
                         };
                     }
@@ -335,9 +339,12 @@ impl LiteView {
                             vec2(THUMB_BOX, THUMB_BOX),
                         );
                         match &self.thumbs[i] {
-                            Thumb::Ready(tex) => {
+                            Thumb::Ready(tex, animated_gif) => {
                                 let r = fit_rect(tex.size_vec2(), thumb_rect, false);
                                 ui.painter().image(tex.id(), r, unit_uv(), Color32::WHITE);
+                                if *animated_gif {
+                                    paint_animated_badge(ui.painter(), thumb_rect);
+                                }
                             }
                             Thumb::NotRequested | Thumb::Pending => {
                                 if matches!(self.thumbs[i], Thumb::NotRequested) {
@@ -467,7 +474,7 @@ impl LiteView {
                         self.video = Some((index, Player::open(path)));
                     }
                     let placeholder = match &self.thumbs[index] {
-                        Thumb::Ready(tex) => Some(tex.clone()),
+                        Thumb::Ready(tex, _) => Some(tex.clone()),
                         _ => None,
                     };
                     let Some((_, slot)) = &mut self.video else { unreachable!() };
@@ -529,7 +536,7 @@ impl LiteView {
                     }
                     None => {
                         // Show the thumbnail as a placeholder while the full image decodes.
-                        if let Thumb::Ready(tex) = &self.thumbs[index] {
+                        if let Thumb::Ready(tex, _) = &self.thumbs[index] {
                             let r = fit_rect(tex.size_vec2(), area, true);
                             painter.image(tex.id(), r, unit_uv(), Color32::from_gray(160));
                         }
@@ -623,6 +630,19 @@ fn paint_play_badge(painter: &egui::Painter, thumb: Rect) {
         Color32::WHITE,
         egui::Stroke::NONE,
     ));
+}
+
+/// "A" badge drawn on thumbnails of animated GIFs (same spot as the video badge).
+fn paint_animated_badge(painter: &egui::Painter, thumb: Rect) {
+    let c = thumb.left_bottom() + vec2(18.0, -18.0);
+    painter.circle_filled(c, 13.0, Color32::from_black_alpha(190));
+    painter.text(
+        c + vec2(0.0, 1.0),
+        Align2::CENTER_CENTER,
+        "A",
+        FontId::proportional(16.0),
+        Color32::WHITE,
+    );
 }
 
 /// Draw a texture fitted into `bounds`, rotated clockwise by `quarter_turns` × 90°.
