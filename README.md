@@ -59,7 +59,7 @@ You need [Rust](https://rustup.rs) and a C++ compiler. The RAR support compiles 
 sources: use the MSVC Build Tools on Windows, the Xcode command-line tools on macOS, and g++ or
 clang on Linux.
 
-Video support needs a released version of the FFmpeg libraries (4.x to 9.1) and `libclang`, which generates the
+Video support needs the FFmpeg libraries (version 4 or newer) and `libclang`, which generates the
 FFmpeg bindings. If you don't want video, skip the FFmpeg steps and build with
 `cargo build --release --no-default-features`.
 
@@ -74,9 +74,8 @@ FFmpeg bindings. If you don't want video, skip the FFmpeg steps and build with
 2. Download a **shared release** FFmpeg build, e.g. `ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip` from
    <https://github.com/BtbN/FFmpeg-Builds/releases>, and unzip it to, e.g., `C:\ffmpeg`
    (so that `C:\ffmpeg\bin`, `C:\ffmpeg\include` and `C:\ffmpeg\lib` exist).
-   Pick a file whose name starts with `ffmpeg-n` (a release). The `ffmpeg-master-latest-…` files
-   are development snapshots, newer than the Rust FFmpeg bindings support, and fail to compile
-   with errors such as ``non-exhaustive patterns: `AV_CODEC_ID_…` not covered``.
+   Release builds (names starting with `ffmpeg-n`) are recommended over the
+   `ffmpeg-master-latest-…` development snapshots.
 3. Point the build at both (PowerShell, in the window you'll build from):
 
    ```bash
@@ -88,6 +87,9 @@ FFmpeg bindings. If you don't want video, skip the FFmpeg steps and build with
    ```bash
    cargo build --release
    ```
+
+   If you switch to a different FFmpeg build later, run `cargo clean -p ffmpeg-sys-next` first so
+   the FFmpeg bindings are regenerated from the new headers.
 
    The FFmpeg DLLs are copied next to `target\release\liteview.exe` automatically. To move the
    program elsewhere, copy those DLLs along with the `.exe`.

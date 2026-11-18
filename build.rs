@@ -10,17 +10,26 @@ fn main() {
 
     let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
     let video = std::env::var_os("CARGO_FEATURE_VIDEO").is_some();
-    let Some(ffmpeg_dir) = std::env::var_os("FFMPEG_DIR") else { return };
+    let Some(ffmpeg_dir) = std::env::var_os("FFMPEG_DIR") else {
+        return;
+    };
     if !windows || !video {
         return;
     }
     // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out; the exe lives in target/<profile>.
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let Some(exe_dir) = out_dir.ancestors().nth(3) else { return };
-    let Ok(entries) = std::fs::read_dir(Path::new(&ffmpeg_dir).join("bin")) else { return };
+    let Some(exe_dir) = out_dir.ancestors().nth(3) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(Path::new(&ffmpeg_dir).join("bin")) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+        {
             let _ = std::fs::copy(&path, exe_dir.join(entry.file_name()));
         }
     }

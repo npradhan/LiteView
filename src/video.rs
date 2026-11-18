@@ -14,9 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use ffmpeg_next as ffmpeg;
 
-use ffmpeg::format::Pixel;
 use ffmpeg::media::Type as MediaType;
-use ffmpeg::software::scaling;
 
 /// Decoded frames are capped at this size (4K UHD); bigger videos are scaled down.
 const MAX_FRAME_W: u32 = 3840;
@@ -45,7 +43,11 @@ fn err(e: impl std::fmt::Display) -> String {
 /// Clockwise quarter turns requested by the stream's display matrix (phone videos).
 fn stream_rotation(stream: &ffmpeg::format::stream::Stream) -> u8 {
     for sd in stream.side_data() {
-        if sd.kind() == ffmpeg::codec::packet::side_data::Type::DisplayMatrix {
+        // Compare the raw type: ffmpeg-next's `kind()` can't map side-data types
+        // newer than the bindings.
+        // SAFETY: reads one field of side data owned by the stream.
+        let kind = unsafe { (*sd.as_ptr()).type_ };
+        if kind == ffmpeg::ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX {
             let d = sd.data();
             if d.len() >= 36 {
                 let m =
@@ -83,16 +85,20 @@ fn display_size(w: u32, h: u32, sar: ffmpeg::Rational) -> (u32, u32) {
 }
 
 /// Converts decoded frames to tightly packed RGBA at a given size.
+///
+/// Calls libswscale directly rather than through ffmpeg-next's `Pixel` enum, so
+/// pixel formats newer than the Rust bindings know about still work.
 struct Rgba {
-    scaler: Option<(scaling::Context, Pixel, u32, u32, u32, u32)>,
-    out: ffmpeg::frame::Video,
+    ctx: *mut ffmpeg::ffi::SwsContext,
+    /// Source format, source size and destination size the context was made for.
+    key: (i32, i32, i32, i32, i32),
 }
 
 impl Rgba {
     fn new() -> Self {
         Rgba {
-            scaler: None,
-            out: ffmpeg::frame::Video::empty(),
+            ctx: std::ptr::null_mut(),
+            key: (0, 0, 0, 0, 0),
         }
     }
 
@@ -102,44 +108,85 @@ impl Rgba {
         dw: u32,
         dh: u32,
     ) -> Result<ColorImage, String> {
-        let key = (frame.format(), frame.width(), frame.height(), dw, dh);
-        let stale = match &self.scaler {
-            Some((_, f, w, h, ow, oh)) => (*f, *w, *h, *ow, *oh) != key,
-            None => true,
+        // SAFETY: plain reads of a decoded AVFrame owned by `frame`.
+        let (fmt, sw, sh) = unsafe {
+            let f = &*frame.as_ptr();
+            (f.format, f.width, f.height)
         };
-        if stale {
-            let ctx = scaling::Context::get(
-                frame.format(),
-                frame.width(),
-                frame.height(),
-                Pixel::RGBA,
-                dw,
-                dh,
-                scaling::Flags::BILINEAR,
-            )
-            .map_err(err)?;
-            self.scaler = Some((ctx, key.0, key.1, key.2, key.3, key.4));
-            self.out = ffmpeg::frame::Video::empty();
+        if sw <= 0 || sh <= 0 {
+            return Err("empty video frame".into());
         }
-        let (ctx, ..) = self.scaler.as_mut().unwrap();
-        ctx.run(frame, &mut self.out).map_err(err)?;
+        let key = (fmt, sw, sh, dw as i32, dh as i32);
+        if self.ctx.is_null() || self.key != key {
+            self.free();
+            // SAFETY: `fmt` was written by FFmpeg itself, so it is a value of the
+            // AVPixelFormat enum generated from this FFmpeg's own headers.
+            self.ctx = unsafe {
+                ffmpeg::ffi::sws_getContext(
+                    sw,
+                    sh,
+                    std::mem::transmute::<i32, ffmpeg::ffi::AVPixelFormat>(fmt),
+                    dw as i32,
+                    dh as i32,
+                    ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+                    2, // SWS_BILINEAR
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            if self.ctx.is_null() {
+                return Err(format!("unsupported video pixel format ({fmt})"));
+            }
+            self.key = key;
+        }
 
+        // The scaler writes opaque RGBA rows straight into the pixel buffer; that is
+        // already valid premultiplied Color32 data.
         let (w, h) = (dw as usize, dh as usize);
-        let stride = self.out.stride(0);
-        let data = self.out.data(0);
-        // The scaler outputs opaque RGBA, which is already valid premultiplied
-        // Color32 data, so whole rows can be copied straight across.
         let mut pixels = vec![Color32::BLACK; w * h];
-        // SAFETY: Color32 is a #[repr(C)] wrapper around [u8; 4].
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, w * h * 4) };
-        for (row, dst) in bytes.chunks_exact_mut(w * 4).enumerate() {
-            dst.copy_from_slice(&data[row * stride..row * stride + w * 4]);
+        let dst: [*mut u8; 4] = [
+            pixels.as_mut_ptr() as *mut u8, // Color32 is #[repr(C)] [u8; 4]
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ];
+        let dst_stride: [i32; 4] = [(w * 4) as i32, 0, 0, 0];
+        // SAFETY: the context matches the frame's format and size; `dst` holds
+        // exactly dh rows of dw RGBA pixels.
+        let rows = unsafe {
+            let f = &*frame.as_ptr();
+            ffmpeg::ffi::sws_scale(
+                self.ctx,
+                f.data.as_ptr() as *const *const u8,
+                f.linesize.as_ptr(),
+                0,
+                sh,
+                dst.as_ptr() as _,
+                dst_stride.as_ptr(),
+            )
+        };
+        if rows <= 0 {
+            return Err("could not convert video frame".into());
         }
         Ok(ColorImage {
             size: [w, h],
             pixels,
         })
+    }
+
+    fn free(&mut self) {
+        if !self.ctx.is_null() {
+            // SAFETY: created by sws_getContext and not used afterwards.
+            unsafe { ffmpeg::ffi::sws_freeContext(self.ctx) };
+            self.ctx = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for Rgba {
+    fn drop(&mut self) {
+        self.free();
     }
 }
 
@@ -854,7 +901,10 @@ mod tests {
         let square = ffmpeg::Rational::new(1, 1);
         assert_eq!(display_size(1920, 1080, square), (1920, 1080));
         // Anamorphic DVD: 720x480 with 32:27 pixels displays as 853x480.
-        assert_eq!(display_size(720, 480, ffmpeg::Rational::new(32, 27)), (853, 480));
+        assert_eq!(
+            display_size(720, 480, ffmpeg::Rational::new(32, 27)),
+            (853, 480)
+        );
         // 8K is capped to 4K.
         assert_eq!(display_size(7680, 4320, square), (3840, 2160));
     }
@@ -863,11 +913,17 @@ mod tests {
     fn rotate_quarter_turn() {
         let px = |v| Color32::from_rgb(v, 0, 0);
         // 2x1 image [a b] rotated clockwise becomes 1x2 [a; b].
-        let img = ColorImage { size: [2, 1], pixels: vec![px(1), px(2)] };
+        let img = ColorImage {
+            size: [2, 1],
+            pixels: vec![px(1), px(2)],
+        };
         let r = rotate_image(img, 1);
         assert_eq!(r.size, [1, 2]);
         assert_eq!(r.pixels, vec![px(1), px(2)]);
-        let img = ColorImage { size: [2, 1], pixels: vec![px(1), px(2)] };
+        let img = ColorImage {
+            size: [2, 1],
+            pixels: vec![px(1), px(2)],
+        };
         let r = rotate_image(img, 3);
         assert_eq!(r.pixels, vec![px(2), px(1)]);
     }
@@ -879,7 +935,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("clip.mp4");
         let made = std::process::Command::new("ffmpeg")
-            .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25"])
+            .args([
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=25",
+            ])
             .args(["-t", "2", "-pix_fmt", "yuv420p"])
             .arg(&clip)
             .status()

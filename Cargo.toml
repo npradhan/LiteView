@@ -18,7 +18,9 @@ sevenz-rust = "0.6"
 unrar = "0.5"
 
 # Video playback (optional, on by default): FFmpeg for decoding, cpal for sound.
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"], optional = true }
+# `non-exhaustive-enums` lets it build against FFmpeg versions newer than the bindings
+# know about (otherwise new codec IDs etc. break compilation).
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling", "non-exhaustive-enums"], optional = true }
 cpal = { version = "0.15", optional = true }
 
 [features]
