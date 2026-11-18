@@ -22,9 +22,16 @@ fn main() {
         );
         return;
     };
-    // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out; the exe lives in target/<profile>.
+    // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out (older Cargo) or
+    // target/<profile>/build/<pkg>/<hash>/out (newer Cargo); either way the exe
+    // lives in the folder that contains `build`.
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let Some(exe_dir) = out_dir.ancestors().nth(3) else {
+    let Some(exe_dir) = exe_dir_from_out_dir(&out_dir) else {
+        println!(
+            "cargo:warning=Could not work out where liteview.exe is built from {}, so the FFmpeg \
+             DLLs were not copied. Copy them next to liteview.exe yourself.",
+            out_dir.display()
+        );
         return;
     };
     let bin = Path::new(&ffmpeg_dir).join("bin");
@@ -65,4 +72,20 @@ fn main() {
             copied.join(", ")
         );
     }
+}
+
+/// The profile folder (e.g. `target/release`): the parent of the nearest `build` folder.
+fn exe_dir_from_out_dir(out_dir: &Path) -> Option<&Path> {
+    out_dir
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "build"))
+        .and_then(Path::parent)
+}
+
+#[test]
+fn finds_exe_dir_in_both_cargo_layouts() {
+    let old = Path::new("/p/target/release/build/liteview-0123abcd/out");
+    let new = Path::new("/p/target/release/build/liteview/0123abcd/out");
+    assert_eq!(exe_dir_from_out_dir(old), Some(Path::new("/p/target/release")));
+    assert_eq!(exe_dir_from_out_dir(new), Some(Path::new("/p/target/release")));
 }
