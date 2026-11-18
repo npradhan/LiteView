@@ -10,13 +10,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Image file extensions that can be decoded.
 pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "bmp", "dib", "tif", "tiff", "webp", "tga",
-    "icb", "vda", "vst", "ico", "cur", "psd", "pbm", "pgm", "ppm", "pnm", "pam", "dds", "hdr", "exr",
-    "qoi", "ff", "farbfeld", "jxl",
+    "icb", "vda", "vst", "ico", "cur", "psd", "pbm", "pgm", "ppm", "pnm", "pam", "dds", "hdr",
+    "exr", "qoi", "ff", "farbfeld", "jxl",
+];
+
+/// Video file extensions (played with FFmpeg when built with the `video` feature).
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "qt", "mkv", "webm", "avi", "wmv", "asf", "flv", "f4v", "mpg", "mpeg",
+    "mpe", "m2v", "ts", "m2ts", "mts", "vob", "3gp", "3g2", "ogv", "divx", "rm", "rmvb",
 ];
 
 /// Archive file extensions that are opened and their images listed as pages.
-pub const ARCHIVE_EXTENSIONS: &[&str] =
-    &["cbz", "zip", "cbr", "rar", "cb7", "7z", "cbt", "tar"];
+pub const ARCHIVE_EXTENSIONS: &[&str] = &["cbz", "zip", "cbr", "rar", "cb7", "7z", "cbt", "tar"];
 
 fn ext_of(name: &str) -> String {
     Path::new(name)
@@ -28,6 +33,10 @@ fn ext_of(name: &str) -> String {
 
 pub fn is_image_name(name: &str) -> bool {
     IMAGE_EXTENSIONS.contains(&ext_of(name).as_str())
+}
+
+pub fn is_video_name(name: &str) -> bool {
+    cfg!(feature = "video") && VIDEO_EXTENSIONS.contains(&ext_of(name).as_str())
 }
 
 pub fn is_archive_name(name: &str) -> bool {
@@ -215,7 +224,10 @@ fn is_hidden_entry(name: &str) -> bool {
 #[derive(Clone)]
 pub enum PageSource {
     File(PathBuf),
-    ArchiveEntry { archive: Arc<Archive>, entry: String },
+    ArchiveEntry {
+        archive: Arc<Archive>,
+        entry: String,
+    },
 }
 
 /// One viewable image.
@@ -232,6 +244,14 @@ impl Page {
         match &self.source {
             PageSource::File(p) => p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
             PageSource::ArchiveEntry { entry, .. } => entry.as_str(),
+        }
+    }
+
+    /// Path of a video file (videos are only played from loose files, not archives).
+    pub fn video_path(&self) -> Option<&Path> {
+        match &self.source {
+            PageSource::File(p) if is_video_name(&self.display_name) => Some(p),
+            _ => None,
         }
     }
 
@@ -278,7 +298,7 @@ fn add_file(path: &Path, pages: &mut Vec<Page>) {
     if name.starts_with('.') {
         return;
     }
-    if is_image_name(&name) {
+    if is_image_name(&name) || is_video_name(&name) {
         pages.push(Page {
             source: PageSource::File(path.to_owned()),
             display_name: name,
@@ -286,7 +306,11 @@ fn add_file(path: &Path, pages: &mut Vec<Page>) {
     } else if is_archive_name(&name) {
         if let Some((archive, entries)) = Archive::open(path) {
             for entry in entries {
-                let short = entry.rsplit(['/', '\\']).next().unwrap_or(&entry).to_owned();
+                let short = entry
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(&entry)
+                    .to_owned();
                 pages.push(Page {
                     display_name: format!("{name} › {short}"),
                     source: PageSource::ArchiveEntry {

@@ -11,6 +11,7 @@ use egui::{
 };
 
 use crate::source::{self, Page};
+use crate::video::Player;
 use crate::worker::{Output, Workers};
 
 const SIDEBAR_WIDTH: f32 = 190.0;
@@ -20,6 +21,12 @@ const ROW_PADDING: f32 = 8.0;
 const ROW_HEIGHT: f32 = THUMB_BOX + LABEL_HEIGHT + ROW_PADDING * 2.0;
 /// How many pages either side of the current one are kept decoded on the GPU.
 const KEEP_RADIUS: usize = 2;
+/// Height of the video controls bar.
+const CONTROLS_HEIGHT: f32 = 52.0;
+/// Seconds of mouse stillness before the video controls hide during playback.
+const CONTROLS_TIMEOUT: f32 = 2.0;
+/// Shift + ←/→ jumps this many seconds in a video.
+const SEEK_STEP: f64 = 10.0;
 
 const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
     magnification: egui::TextureFilter::Linear,
@@ -67,6 +74,8 @@ pub struct LiteView {
     pick_folder_requested: bool,
     /// Whether the right-click menu was open last frame (Esc then closes it instead of quitting).
     menu_open: bool,
+    /// The player for the current page, when it is a video (or why it failed to open).
+    video: Option<(usize, Result<Player, String>)>,
 }
 
 impl LiteView {
@@ -80,12 +89,17 @@ impl LiteView {
             folder,
             current: 0,
             cache: HashMap::new(),
-            anim: Animation { index: usize::MAX, frame: 0, frame_started: Instant::now() },
+            anim: Animation {
+                index: usize::MAX,
+                frame: 0,
+                frame_started: Instant::now(),
+            },
             show_sidebar: true,
             scroll_to_current: true,
             last_wheel_nav: Instant::now(),
             pick_folder_requested: false,
             menu_open: false,
+            video: None,
         };
         app.go_to(&cc.egui_ctx, 0);
         app
@@ -99,6 +113,7 @@ impl LiteView {
         self.pages = pages;
         self.folder = folder;
         self.cache.clear();
+        self.video = None;
         self.anim.index = usize::MAX;
         self.current = 0;
         self.go_to(ctx, 0);
@@ -107,7 +122,7 @@ impl LiteView {
     /// Ask the user for a new folder and switch to it (no-op if they cancel).
     fn pick_folder(&mut self, ctx: &egui::Context) {
         let dialog = rfd::FileDialog::new()
-            .set_title("LiteView — choose a folder of images")
+            .set_title("LiteView — choose a folder of images and videos")
             .set_directory(&self.folder);
         if let Some(folder) = dialog.pick_folder() {
             self.open_folder(ctx, folder);
@@ -128,10 +143,13 @@ impl LiteView {
             self.scroll_to_current = true;
         }
         self.current = index;
+        // Leaving a video stops it; coming back starts it from the beginning.
+        if self.video.as_ref().is_some_and(|(i, _)| *i != index) {
+            self.video = None;
+        }
 
         // Free pages that are far away, then queue the current page and its neighbours.
-        self.cache
-            .retain(|&i, _| i.abs_diff(index) <= KEEP_RADIUS);
+        self.cache.retain(|&i, _| i.abs_diff(index) <= KEEP_RADIUS);
         let mut wanted = vec![index];
         for d in 1..=KEEP_RADIUS {
             if index + d < n {
@@ -141,7 +159,7 @@ impl LiteView {
                 wanted.push(i);
             }
         }
-        wanted.retain(|i| !self.cache.contains_key(i));
+        wanted.retain(|&i| !self.cache.contains_key(&i) && self.pages[i].video_path().is_none());
         self.workers.request_full(&wanted);
 
         ctx.send_viewport_cmd(ViewportCommand::Title(format!(
@@ -197,6 +215,14 @@ impl LiteView {
         }
     }
 
+    /// The player for the current page, if it is a video that opened successfully.
+    fn player_mut(&mut self) -> Option<&mut Player> {
+        match &mut self.video {
+            Some((i, Ok(p))) if *i == self.current => Some(p),
+            _ => None,
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let n = self.pages.len();
         let (next, prev, first, last, pg_down, pg_up, esc, tab, f11, open) = ctx.input(|i| {
@@ -216,6 +242,25 @@ impl LiteView {
         if esc && !self.menu_open {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
+        }
+        let (space, mute, shift) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Space),
+                i.key_pressed(Key::M),
+                i.modifiers.shift,
+            )
+        });
+        if let Some(player) = self.player_mut() {
+            if space {
+                player.toggle_pause();
+            }
+            if mute {
+                player.toggle_mute();
+            }
+            if shift && (next || prev) {
+                player.seek_relative(if next { SEEK_STEP } else { -SEEK_STEP });
+                return;
+            }
         }
         if tab {
             self.show_sidebar = !self.show_sidebar;
@@ -316,6 +361,10 @@ impl LiteView {
                             }
                         }
 
+                        if self.pages[i].video_path().is_some() {
+                            paint_play_badge(ui.painter(), thumb_rect);
+                        }
+
                         let name = &self.pages[i].display_name;
                         let label_rect = Rect::from_min_size(
                             pos2(rect.left() + 6.0, thumb_rect.bottom() + 2.0),
@@ -352,6 +401,21 @@ impl LiteView {
 
                 // egui closes this menu by itself on Esc or a click elsewhere.
                 resp.context_menu(|ui| {
+                    if let Some(player) = self.player_mut() {
+                        let label = if player.is_paused() { "Play" } else { "Pause" };
+                        if ui.button(label).clicked() {
+                            player.toggle_pause();
+                            ui.close_menu();
+                        }
+                        if player.has_audio() {
+                            let label = if player.is_muted() { "Unmute" } else { "Mute" };
+                            if ui.button(label).clicked() {
+                                player.toggle_mute();
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                    }
                     if ui.button("Load Folder…").clicked() {
                         self.pick_folder_requested = true;
                         ui.close_menu();
@@ -397,6 +461,31 @@ impl LiteView {
                     self.pages.len(),
                     self.pages[index].display_name
                 );
+                let mut bottom_inset = 0.0;
+                if let Some(path) = self.pages[index].video_path() {
+                    if self.video.as_ref().is_none_or(|(i, _)| *i != index) {
+                        self.video = Some((index, Player::open(path)));
+                    }
+                    let placeholder = match &self.thumbs[index] {
+                        Thumb::Ready(tex) => Some(tex.clone()),
+                        _ => None,
+                    };
+                    let Some((_, slot)) = &mut self.video else { unreachable!() };
+                    match slot {
+                        Ok(player) => {
+                            bottom_inset = video_view(ctx, ui, &painter, area, &resp, player, placeholder);
+                        }
+                        Err(e) => {
+                            painter.text(
+                                area.center(),
+                                Align2::CENTER_CENTER,
+                                format!("Could not play {}\n{e}", self.pages[index].display_name),
+                                FontId::proportional(18.0),
+                                Color32::from_rgb(230, 140, 90),
+                            );
+                        }
+                    }
+                } else {
                 match self.cache.get(&index) {
                     Some(Slot::Loaded(loaded)) => {
                         if self.anim.index != index {
@@ -454,14 +543,19 @@ impl LiteView {
                     }
                 }
 
-                // Page indicator, bottom-right.
+                }
+
+                // Page indicator, bottom-right (above the video controls when shown).
                 let galley = painter.layout_no_wrap(
                     info,
                     FontId::proportional(13.0),
                     Color32::from_gray(210),
                 );
                 let size = galley.size() + vec2(16.0, 8.0);
-                let bg = Rect::from_min_size(area.right_bottom() - size - vec2(8.0, 8.0), size);
+                let bg = Rect::from_min_size(
+                    area.right_bottom() - size - vec2(8.0, 8.0 + bottom_inset),
+                    size,
+                );
                 painter.rect_filled(bg, 4.0, Color32::from_black_alpha(160));
                 painter.galley(bg.min + vec2(8.0, 4.0), galley, Color32::from_gray(210));
             });
@@ -514,4 +608,230 @@ fn truncated_galley(ui: &egui::Ui, text: &str, width: f32) -> Arc<egui::Galley> 
         overflow_character: Some('…'),
     };
     ui.fonts(|f| f.layout_job(job))
+}
+
+/// Small "play" badge drawn on video thumbnails.
+fn paint_play_badge(painter: &egui::Painter, thumb: Rect) {
+    let c = thumb.left_bottom() + vec2(18.0, -18.0);
+    painter.circle_filled(c, 13.0, Color32::from_black_alpha(190));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            c + vec2(-4.0, -7.0),
+            c + vec2(7.0, 0.0),
+            c + vec2(-4.0, 7.0),
+        ],
+        Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// Draw a texture fitted into `bounds`, rotated clockwise by `quarter_turns` × 90°.
+fn paint_rotated(
+    painter: &egui::Painter,
+    tex: &TextureHandle,
+    bounds: Rect,
+    quarter_turns: u8,
+    tint: Color32,
+) {
+    let mut size = tex.size_vec2();
+    if quarter_turns % 2 == 1 {
+        size = vec2(size.y, size.x);
+    }
+    let r = fit_rect(size, bounds, true);
+    let corners = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+    ];
+    let uvs = [
+        pos2(0.0, 0.0),
+        pos2(1.0, 0.0),
+        pos2(1.0, 1.0),
+        pos2(0.0, 1.0),
+    ];
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for (j, corner) in corners.into_iter().enumerate() {
+        let uv = uvs[(j + 4 - quarter_turns as usize % 4) % 4];
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: corner,
+            uv,
+            color: tint,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn format_time(t: f64) -> String {
+    let t = t.max(0.0) as u64;
+    let (h, m, s) = (t / 3600, (t / 60) % 60, t % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Plays the current video: shows the due frame and the auto-hiding controls bar.
+/// Returns the height the controls cover at the bottom (0 when hidden).
+fn video_view(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    area: Rect,
+    resp: &egui::Response,
+    player: &mut Player,
+    placeholder: Option<TextureHandle>,
+) -> f32 {
+    let next = player.update(ctx);
+    ctx.request_repaint_after(next);
+
+    match player.texture() {
+        Some(tex) => paint_rotated(painter, tex, area, player.rotation(), Color32::WHITE),
+        None => {
+            if let Some(err) = player.error() {
+                painter.text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    format!("Could not play this video\n{err}"),
+                    FontId::proportional(18.0),
+                    Color32::from_rgb(230, 140, 90),
+                );
+                return 0.0;
+            }
+            if let Some(tex) = placeholder {
+                // The thumbnail is already rotated.
+                paint_rotated(painter, &tex, area, 0, Color32::from_gray(160));
+            }
+        }
+    }
+
+    if resp.clicked() {
+        player.toggle_pause();
+    }
+
+    let pointer_still = ctx.input(|i| i.pointer.time_since_last_movement()) > CONTROLS_TIMEOUT;
+    let show = player.is_paused() || !pointer_still;
+    if !show {
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+        // Wake up again when the pointer moves (egui repaints on input anyway).
+        return 0.0;
+    }
+    ctx.request_repaint_after(Duration::from_secs_f32(CONTROLS_TIMEOUT));
+
+    let bar = Rect::from_min_max(
+        pos2(area.left(), area.bottom() - CONTROLS_HEIGHT),
+        area.right_bottom(),
+    );
+    painter.rect_filled(bar, 0.0, Color32::from_black_alpha(170));
+    // Clicks on the bar's background shouldn't fall through and pause the video.
+    let _ = ui.interact(bar, ui.id().with("video-bar"), Sense::click());
+
+    // Play / pause button.
+    let button = Rect::from_center_size(pos2(bar.left() + 30.0, bar.center().y), vec2(36.0, 36.0));
+    let b = ui.interact(button, ui.id().with("video-play"), Sense::click());
+    let fg = if b.hovered() {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(220)
+    };
+    let c = button.center();
+    if player.is_paused() {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                c + vec2(-7.0, -10.0),
+                c + vec2(11.0, 0.0),
+                c + vec2(-7.0, 10.0),
+            ],
+            fg,
+            egui::Stroke::NONE,
+        ));
+    } else {
+        for dx in [-5.0, 5.0] {
+            painter.rect_filled(
+                Rect::from_center_size(c + vec2(dx, 0.0), vec2(5.0, 20.0)),
+                1.0,
+                fg,
+            );
+        }
+    }
+    if b.clicked() {
+        player.toggle_pause();
+    }
+
+    // Time and mute status.
+    let duration = player.duration();
+    let mut label = if duration > 0.0 {
+        format!(
+            "{} / {}",
+            format_time(player.position()),
+            format_time(duration)
+        )
+    } else {
+        format_time(player.position())
+    };
+    if player.is_muted() {
+        label.push_str("   muted");
+    } else if !player.has_audio() {
+        label.push_str("   no sound");
+    }
+    let text = painter.layout_no_wrap(label, FontId::proportional(14.0), Color32::from_gray(220));
+    let text_w = text.size().x;
+    painter.galley(
+        pos2(button.right() + 10.0, bar.center().y - text.size().y / 2.0),
+        text,
+        Color32::WHITE,
+    );
+
+    // Seek bar.
+    if duration > 0.0 {
+        let left = button.right() + 24.0 + text_w;
+        let right = bar.right() - 20.0;
+        if right - left > 40.0 {
+            let hit = Rect::from_min_max(pos2(left, bar.top()), pos2(right, bar.bottom()));
+            let r = ui.interact(hit, ui.id().with("video-seek"), Sense::click_and_drag());
+            let track_h = if r.hovered() || r.dragged() { 8.0 } else { 5.0 };
+            let track = Rect::from_center_size(
+                pos2((left + right) / 2.0, bar.center().y),
+                vec2(right - left, track_h),
+            );
+            let mut frac = (player.position() / duration).clamp(0.0, 1.0) as f32;
+            if let Some(p) = r.interact_pointer_pos() {
+                if r.clicked() || r.dragged() || r.drag_stopped() {
+                    let f = ((p.x - left) / (right - left)).clamp(0.0, 1.0);
+                    let target = f as f64 * duration;
+                    if (target - player.position()).abs() > duration * 0.002 {
+                        player.seek(target);
+                    }
+                    frac = f;
+                }
+            }
+            painter.rect_filled(track, track_h / 2.0, Color32::from_white_alpha(60));
+            let done = Rect::from_min_max(
+                track.min,
+                pos2(track.left() + track.width() * frac, track.max.y),
+            );
+            painter.rect_filled(done, track_h / 2.0, Color32::from_rgb(70, 140, 230));
+            painter.circle_filled(
+                pos2(done.right(), track.center().y),
+                track_h,
+                Color32::WHITE,
+            );
+        }
+    }
+
+    if player.is_finished() {
+        painter.text(
+            area.center(),
+            Align2::CENTER_CENTER,
+            "Press Space to play again",
+            FontId::proportional(18.0),
+            Color32::from_gray(230),
+        );
+    }
+    CONTROLS_HEIGHT
 }

@@ -2,7 +2,7 @@
 name = "liteview"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, lightweight full-screen image and comic viewer"
+description = "A fast, lightweight full-screen image, comic and video viewer"
 license = "MIT"
 
 [dependencies]
@@ -16,6 +16,14 @@ zip = { version = "2", default-features = false, features = ["deflate", "deflate
 tar = "0.4"
 sevenz-rust = "0.6"
 unrar = "0.5"
+
+# Video playback (optional, on by default): FFmpeg for decoding, cpal for sound.
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"], optional = true }
+cpal = { version = "0.15", optional = true }
+
+[features]
+default = ["video"]
+video = ["dep:ffmpeg-next", "dep:cpal"]
 
 [profile.release]
 opt-level = 3

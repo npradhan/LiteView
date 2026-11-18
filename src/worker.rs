@@ -14,8 +14,14 @@ use crate::source::Page;
 pub const THUMB_SIDE: u32 = 256;
 
 pub enum Output {
-    Full { index: usize, result: Result<Decoded, String> },
-    Thumb { index: usize, result: Result<ColorImage, String> },
+    Full {
+        index: usize,
+        result: Result<Decoded, String>,
+    },
+    Thumb {
+        index: usize,
+        result: Result<ColorImage, String>,
+    },
 }
 
 #[derive(Default)]
@@ -113,9 +119,12 @@ fn worker_loop(
             }
             Job::Thumb(index) => {
                 let page = &pages[index];
-                let result = page
-                    .read_bytes()
-                    .and_then(|b| decode::decode_thumbnail(&b, page.file_name(), THUMB_SIDE));
+                let result = match page.video_path() {
+                    Some(path) => crate::video::thumbnail(path, THUMB_SIDE),
+                    None => page
+                        .read_bytes()
+                        .and_then(|b| decode::decode_thumbnail(&b, page.file_name(), THUMB_SIDE)),
+                };
                 Output::Thumb { index, result }
             }
         };

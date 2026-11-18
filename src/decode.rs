@@ -33,7 +33,10 @@ pub fn decode_full(bytes: &[u8], file_name: &str) -> Result<Decoded, String> {
                     delay,
                 })
                 .collect();
-            return Ok(Decoded { frames, original_size });
+            return Ok(Decoded {
+                frames,
+                original_size,
+            });
         }
     }
     let img = decode_still(bytes, file_name)?;
@@ -48,7 +51,11 @@ pub fn decode_full(bytes: &[u8], file_name: &str) -> Result<Decoded, String> {
 }
 
 /// Decode only the first frame and shrink it to fit within `max_side`.
-pub fn decode_thumbnail(bytes: &[u8], file_name: &str, max_side: u32) -> Result<ColorImage, String> {
+pub fn decode_thumbnail(
+    bytes: &[u8],
+    file_name: &str,
+    max_side: u32,
+) -> Result<ColorImage, String> {
     let img = decode_still(bytes, file_name)?;
     let thumb = if img.width() > max_side || img.height() > max_side {
         img.thumbnail(max_side, max_side)
@@ -81,7 +88,9 @@ enum Kind {
 
 fn detect(bytes: &[u8], file_name: &str) -> Option<Kind> {
     if bytes.starts_with(&[0xFF, 0x0A])
-        || bytes.starts_with(&[0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A])
+        || bytes.starts_with(&[
+            0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+        ])
     {
         return Some(Kind::Jxl);
     }
@@ -151,7 +160,10 @@ fn try_decode_animation(bytes: &[u8]) -> Result<Option<RawFrames>, String> {
             if !dec.is_apng().unwrap_or(false) {
                 return Ok(None);
             }
-            dec.apng().map_err(|e| e.to_string())?.into_frames().collect_frames()
+            dec.apng()
+                .map_err(|e| e.to_string())?
+                .into_frames()
+                .collect_frames()
         }
         Ok(ImageFormat::WebP) => {
             let dec = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))

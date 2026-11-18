@@ -3,6 +3,11 @@
 mod app;
 mod decode;
 mod source;
+#[cfg(feature = "video")]
+mod video;
+#[cfg(not(feature = "video"))]
+#[path = "video_stub.rs"]
+mod video;
 mod worker;
 
 use std::path::PathBuf;
@@ -10,14 +15,11 @@ use std::path::PathBuf;
 fn main() -> eframe::Result<()> {
     // A folder (or a single archive/image) may be given on the command line;
     // otherwise ask the user to pick a folder.
-    let path = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .or_else(|| {
-            rfd::FileDialog::new()
-                .set_title("LiteView — choose a folder of images")
-                .pick_folder()
-        });
+    let path = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
+        rfd::FileDialog::new()
+            .set_title("LiteView — choose a folder of images and videos")
+            .pick_folder()
+    });
     let Some(path) = path else {
         return Ok(());
     };
