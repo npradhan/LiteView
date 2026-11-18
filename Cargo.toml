@@ -1,0 +1,38 @@
+[package]
+name = "liteview"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, lightweight full-screen image, comic and video viewer"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp", "rayon"] }
+jxl-oxide = { version = "0.12", features = ["image"] }
+psd = "0.3"
+rfd = "0.15"
+zip = { version = "2", default-features = false, features = ["deflate", "deflate64", "bzip2", "lzma", "zstd"] }
+tar = "0.4"
+sevenz-rust = "0.6"
+unrar = "0.5"
+
+# Video playback (optional, on by default): FFmpeg for decoding, cpal for sound.
+# `non-exhaustive-enums` lets it build against FFmpeg versions newer than the bindings
+# know about (otherwise new codec IDs etc. break compilation).
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling", "non-exhaustive-enums"], optional = true }
+cpal = { version = "0.15", optional = true }
+
+[features]
+default = ["video"]
+video = ["dep:ffmpeg-next", "dep:cpal"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Image decoders are painfully slow without optimisation; keep them fast in dev builds too.
+[profile.dev.package."*"]
+opt-level = 3
