@@ -35,6 +35,7 @@ those needs native libraries (pdfium, dav1d, libheif), and LiteView builds witho
 | Click a thumbnail | Open that image |
 | Tab | Show / hide the thumbnail column |
 | F11 | Toggle full screen |
+| Right-click → Load Folder… | Open another folder |
 | O | Open another folder |
 | Esc | Quit |
 

@@ -63,6 +63,10 @@ pub struct LiteView {
     show_sidebar: bool,
     scroll_to_current: bool,
     last_wheel_nav: Instant,
+    /// Set by the context menu or the O key; the dialog opens once the frame is drawn.
+    pick_folder_requested: bool,
+    /// Whether the right-click menu was open last frame (Esc then closes it instead of quitting).
+    menu_open: bool,
 }
 
 impl LiteView {
@@ -80,6 +84,8 @@ impl LiteView {
             show_sidebar: true,
             scroll_to_current: true,
             last_wheel_nav: Instant::now(),
+            pick_folder_requested: false,
+            menu_open: false,
         };
         app.go_to(&cc.egui_ctx, 0);
         app
@@ -96,6 +102,16 @@ impl LiteView {
         self.anim.index = usize::MAX;
         self.current = 0;
         self.go_to(ctx, 0);
+    }
+
+    /// Ask the user for a new folder and switch to it (no-op if they cancel).
+    fn pick_folder(&mut self, ctx: &egui::Context) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("LiteView — choose a folder of images")
+            .set_directory(&self.folder);
+        if let Some(folder) = dialog.pick_folder() {
+            self.open_folder(ctx, folder);
+        }
     }
 
     fn go_to(&mut self, ctx: &egui::Context, index: usize) {
@@ -197,7 +213,7 @@ impl LiteView {
                 i.key_pressed(Key::O),
             )
         });
-        if esc {
+        if esc && !self.menu_open {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
@@ -210,12 +226,7 @@ impl LiteView {
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fs));
         }
         if open {
-            let dialog = rfd::FileDialog::new()
-                .set_title("LiteView — choose a folder of images")
-                .set_directory(&self.folder);
-            if let Some(folder) = dialog.pick_folder() {
-                self.open_folder(ctx, folder);
-            }
+            self.pick_folder_requested = true;
             return;
         }
         if n == 0 {
@@ -336,8 +347,17 @@ impl LiteView {
             .frame(egui::Frame::new().fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let area = ui.max_rect();
-                let resp = ui.allocate_rect(area, Sense::hover());
+                let resp = ui.allocate_rect(area, Sense::click());
                 let painter = ui.painter_at(area);
+
+                // egui closes this menu by itself on Esc or a click elsewhere.
+                resp.context_menu(|ui| {
+                    if ui.button("Load Folder…").clicked() {
+                        self.pick_folder_requested = true;
+                        ui.close_menu();
+                    }
+                });
+                self.menu_open = resp.context_menu_opened();
 
                 if self.pages.is_empty() {
                     painter.text(
@@ -456,6 +476,10 @@ impl eframe::App for LiteView {
             self.sidebar(ctx);
         }
         self.viewer(ctx);
+
+        if std::mem::take(&mut self.pick_folder_requested) {
+            self.pick_folder(ctx);
+        }
     }
 }
 
