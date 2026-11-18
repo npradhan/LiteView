@@ -824,14 +824,5 @@ fn video_view(
         }
     }
 
-    if player.is_finished() {
-        painter.text(
-            area.center(),
-            Align2::CENTER_CENTER,
-            "Press Space to play again",
-            FontId::proportional(18.0),
-            Color32::from_gray(230),
-        );
-    }
     CONTROLS_HEIGHT
 }

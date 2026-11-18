@@ -521,9 +521,6 @@ impl Player {
     pub fn is_paused(&self) -> bool {
         self.paused || self.finished
     }
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
     pub fn has_audio(&self) -> bool {
         self.audio.is_some()
     }
@@ -648,19 +645,18 @@ impl Player {
             }
         }
 
-        if eof && self.waiting_first {
-            // Seeked past the last frame: nothing more to show.
+        // At the end, start again from the beginning. While paused, wait for play.
+        let at_end = eof
+            && !self.finished
+            && (self.waiting_first || self.shared.audio.lock().unwrap().samples.is_empty());
+        if at_end && !self.paused {
+            if self.texture.is_some() {
+                self.seek(0.0);
+                return Duration::from_millis(5);
+            }
+            // Never managed to show a frame: stop rather than restart forever.
             self.waiting_first = false;
             self.finished = true;
-        }
-        if eof && !self.finished && !self.waiting_first {
-            let audio_left = self.shared.audio.lock().unwrap().samples.len();
-            if audio_left == 0 || self.paused {
-                self.finished = true;
-                if self.duration > 0.0 {
-                    self.position = self.position.max(self.duration.min(self.position + 0.1));
-                }
-            }
         }
 
         if self.paused || self.finished {

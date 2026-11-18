@@ -45,12 +45,13 @@ While a video is showing:
 
 | Key | Action |
 | --- | --- |
-| Space, or click the video | Play / pause (replays when finished) |
+| Space, or click the video | Play / pause |
 | M | Mute / unmute |
 | Shift + → / ← | Jump forward / back 10 seconds |
 | Click or drag the seek bar | Jump to that point |
 | Right-click | Play / Pause and Mute are also in the menu |
 
+Videos loop: when one ends it starts again from the beginning.
 The controls bar appears when you move the mouse and hides after two seconds of playback.
 
 ## Building

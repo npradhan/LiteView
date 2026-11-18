@@ -32,9 +32,6 @@ impl Player {
     pub fn is_paused(&self) -> bool {
         match *self {}
     }
-    pub fn is_finished(&self) -> bool {
-        match *self {}
-    }
     pub fn has_audio(&self) -> bool {
         match *self {}
     }
