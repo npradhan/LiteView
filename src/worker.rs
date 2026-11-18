@@ -21,8 +21,8 @@ pub enum Output {
     Thumb {
         index: usize,
         result: Result<ColorImage, String>,
-        /// The page is an animated GIF (shown with an "A" badge).
-        animated_gif: bool,
+        /// The page is an animated GIF, PNG or WebP (shown with an "A" badge).
+        animated: bool,
     },
 }
 
@@ -121,18 +121,18 @@ fn worker_loop(
             }
             Job::Thumb(index) => {
                 let page = &pages[index];
-                let mut animated_gif = false;
+                let mut animated = false;
                 let result = match page.video_path() {
                     Some(path) => crate::video::thumbnail(path, THUMB_SIDE),
                     None => page.read_bytes().and_then(|b| {
-                        animated_gif = decode::is_animated_gif(&b);
+                        animated = decode::is_animated(&b);
                         decode::decode_thumbnail(&b, page.file_name(), THUMB_SIDE)
                     }),
                 };
                 Output::Thumb {
                     index,
                     result,
-                    animated_gif,
+                    animated,
                 }
             }
         };

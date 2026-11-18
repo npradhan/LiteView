@@ -7,7 +7,7 @@ A fast, lightweight full-screen image, comic and video viewer written in Rust (e
 - Pick a folder at start-up (or pass a folder / archive / image path on the command line).
 - Full-screen viewing, images fitted to the screen.
 - Thumbnail column on the left with the file name under each thumbnail; click one to open it.
-  Animated GIFs are marked with an **A** badge and videos with a ▶ badge.
+  Animated GIF, PNG and WebP images are marked with an **A** badge and videos with a ▶ badge.
 - Animated GIF, APNG and animated WebP playback.
 - Video playback with sound (via FFmpeg), with an auto-hiding seek bar.
 - Comic-book archives are opened and their pages listed alongside loose images.

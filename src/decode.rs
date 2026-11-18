@@ -50,14 +50,28 @@ pub fn decode_full(bytes: &[u8], file_name: &str) -> Result<Decoded, String> {
     })
 }
 
-/// Whether the bytes are a GIF with more than one frame. Decodes at most two frames.
-pub fn is_animated_gif(bytes: &[u8]) -> bool {
-    if image::guess_format(bytes).ok() != Some(ImageFormat::Gif) {
-        return false;
+/// Whether the bytes are an animated GIF, PNG (APNG) or WebP with more than one
+/// frame. Decodes at most two frames.
+pub fn is_animated(bytes: &[u8]) -> bool {
+    fn two_frames<'a>(frames: image::Frames<'a>) -> bool {
+        frames.take(2).filter(|f| f.is_ok()).count() == 2
     }
-    match image::codecs::gif::GifDecoder::new(Cursor::new(bytes)) {
-        Ok(dec) => dec.into_frames().take(2).filter(|f| f.is_ok()).count() == 2,
-        Err(_) => false,
+    let cursor = Cursor::new(bytes);
+    match image::guess_format(bytes) {
+        Ok(ImageFormat::Gif) => {
+            image::codecs::gif::GifDecoder::new(cursor).is_ok_and(|d| two_frames(d.into_frames()))
+        }
+        Ok(ImageFormat::Png) => match image::codecs::png::PngDecoder::new(cursor) {
+            Ok(d) if d.is_apng().unwrap_or(false) => {
+                d.apng().is_ok_and(|a| two_frames(a.into_frames()))
+            }
+            _ => false,
+        },
+        Ok(ImageFormat::WebP) => match image::codecs::webp::WebPDecoder::new(cursor) {
+            Ok(d) if d.has_animation() => two_frames(d.into_frames()),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -233,12 +247,25 @@ mod tests {
             (ImageFormat::WebP, "a.webp"),
         ] {
             let bytes = encode(&img, fmt);
-            assert!(!is_animated_gif(&bytes), "{name} is not an animated GIF");
+            assert!(!is_animated(&bytes), "{name} is a still image");
             let d = decode_full(&bytes, name).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(d.original_size, [40, 30], "{name}");
             assert_eq!(d.frames.len(), 1);
             let t = decode_thumbnail(&bytes, name, 20).unwrap();
             assert_eq!(t.size, [20, 15], "{name}");
+        }
+    }
+
+    #[test]
+    fn detects_and_plays_apng_and_animated_webp() {
+        // 16x16, two frames each (red, then blue).
+        for (bytes, name) in [
+            (&include_bytes!("../testdata/anim.png")[..], "anim.png"),
+            (&include_bytes!("../testdata/anim.webp")[..], "anim.webp"),
+        ] {
+            assert!(is_animated(bytes), "{name}");
+            let d = decode_full(bytes, name).unwrap();
+            assert_eq!(d.frames.len(), 2, "{name}");
         }
     }
 
@@ -258,7 +285,7 @@ mod tests {
             });
             enc.encode_frames(frames).unwrap();
         }
-        assert!(is_animated_gif(&buf));
+        assert!(is_animated(&buf));
         let d = decode_full(&buf, "x.gif").unwrap();
         assert_eq!(d.frames.len(), 3);
         assert_eq!(d.frames[0].delay, Duration::from_millis(50));

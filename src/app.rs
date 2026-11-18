@@ -38,7 +38,7 @@ const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
 enum Thumb {
     NotRequested,
     Pending,
-    /// The texture, and whether the page is an animated GIF.
+    /// The texture, and whether the page is an animated image.
     Ready(TextureHandle, bool),
     Failed,
 }
@@ -203,13 +203,13 @@ impl LiteView {
                 Output::Thumb {
                     index,
                     result,
-                    animated_gif,
+                    animated,
                 } => {
                     if let Some(t) = self.thumbs.get_mut(index) {
                         *t = match result {
                             Ok(img) => Thumb::Ready(
                                 ctx.load_texture(format!("thumb-{index}"), img, TEXTURE_OPTIONS),
-                                animated_gif,
+                                animated,
                             ),
                             Err(_) => Thumb::Failed,
                         };
@@ -339,10 +339,10 @@ impl LiteView {
                             vec2(THUMB_BOX, THUMB_BOX),
                         );
                         match &self.thumbs[i] {
-                            Thumb::Ready(tex, animated_gif) => {
+                            Thumb::Ready(tex, animated) => {
                                 let r = fit_rect(tex.size_vec2(), thumb_rect, false);
                                 ui.painter().image(tex.id(), r, unit_uv(), Color32::WHITE);
-                                if *animated_gif {
+                                if *animated {
                                     paint_animated_badge(ui.painter(), thumb_rect);
                                 }
                             }
@@ -632,7 +632,7 @@ fn paint_play_badge(painter: &egui::Painter, thumb: Rect) {
     ));
 }
 
-/// "A" badge drawn on thumbnails of animated GIFs (same spot as the video badge).
+/// "A" badge drawn on thumbnails of animated GIF/PNG/WebP images (same spot as the video badge).
 fn paint_animated_badge(painter: &egui::Painter, thumb: Rect) {
     let c = thumb.left_bottom() + vec2(18.0, -18.0);
     painter.circle_filled(c, 13.0, Color32::from_black_alpha(190));
