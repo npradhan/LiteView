@@ -62,7 +62,7 @@ impl Workers {
     /// Replace pending full-image requests (most important first).
     pub fn request_full(&self, indices: &[usize]) {
         let (lock, cv) = &*self.shared;
-        let mut q = lock.lock().unwrap();
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.full.clear();
         q.full.extend(indices.iter().copied());
         cv.notify_all();
@@ -70,7 +70,10 @@ impl Workers {
 
     pub fn request_thumb(&self, index: usize) {
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap().thumbs.push(index);
+        lock.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .thumbs
+            .push(index);
         cv.notify_one();
     }
 }
@@ -78,7 +81,7 @@ impl Workers {
 impl Drop for Workers {
     fn drop(&mut self) {
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap().shutdown = true;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).shutdown = true;
         cv.notify_all();
     }
 }
@@ -97,7 +100,7 @@ fn worker_loop(
     let (lock, cv) = &*shared;
     loop {
         let job = {
-            let mut q = lock.lock().unwrap();
+            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if q.shutdown {
                     return;
@@ -108,27 +111,28 @@ fn worker_loop(
                 if let Some(i) = q.thumbs.pop() {
                     break Job::Thumb(i);
                 }
-                q = cv.wait(q).unwrap();
+                q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
         let out = match job {
             Job::Full(index) => {
                 let page = &pages[index];
-                let result = page
-                    .read_bytes()
-                    .and_then(|b| decode::decode_full(&b, page.file_name()));
+                let result = guarded(|| {
+                    page.read_bytes()
+                        .and_then(|b| decode::decode_full(&b, page.file_name()))
+                });
                 Output::Full { index, result }
             }
             Job::Thumb(index) => {
                 let page = &pages[index];
                 let mut animated = false;
-                let result = match page.video_path() {
+                let result = guarded(|| match page.video_path() {
                     Some(path) => crate::video::thumbnail(path, THUMB_SIDE),
                     None => page.read_bytes().and_then(|b| {
                         animated = decode::is_animated(&b);
                         decode::decode_thumbnail(&b, page.file_name(), THUMB_SIDE)
                     }),
-                };
+                });
                 Output::Thumb {
                     index,
                     result,
@@ -141,4 +145,11 @@ fn worker_loop(
         }
         ctx.request_repaint();
     }
+}
+
+/// Run a decoding job, turning a panic inside a decoder library into an error for
+/// that one file, so a bad file can't take a decoder thread (or the app) down.
+fn guarded<T>(job: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+        .unwrap_or_else(|panic| Err(format!("decoder failed: {}", crate::panic_message(&*panic))))
 }

@@ -495,7 +495,7 @@ impl LiteView {
                 } else {
                 match self.cache.get(&index) {
                     Some(Slot::Loaded(loaded)) => {
-                        if self.anim.index != index {
+                        if self.anim.index != index || self.anim.frame >= loaded.frames.len() {
                             self.anim = Animation { index, frame: 0, frame_started: Instant::now() };
                         }
                         let frame_count = loaded.frames.len();

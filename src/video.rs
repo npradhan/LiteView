@@ -23,6 +23,8 @@ const MAX_FRAME_H: u32 = 2160;
 const QUEUE_FRAMES: usize = 12;
 /// Never queue more than this, even when audio is starved (memory safety valve).
 const QUEUE_FRAMES_HARD: usize = 48;
+/// Memory budget for queued frames (the frame cap shrinks for big videos).
+const QUEUE_BYTES: usize = 384 << 20;
 /// Audio buffered ahead, in seconds.
 const AUDIO_AHEAD: f64 = 0.5;
 /// Re-sync the picture clock to the audio clock when they drift further apart than this.
@@ -34,6 +36,16 @@ pub fn init() {
         let _ = ffmpeg::init();
         ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Fatal);
     });
+}
+
+/// Seconds per timestamp tick, falling back to a common default for broken streams.
+fn time_base_secs(tb: ffmpeg::Rational) -> f64 {
+    let v = f64::from(tb);
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        1.0 / 90_000.0
+    }
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -92,6 +104,9 @@ struct Rgba {
     ctx: *mut ffmpeg::ffi::SwsContext,
     /// Source format, source size and destination size the context was made for.
     key: (i32, i32, i32, i32, i32),
+    /// Destination frame allocated by FFmpeg, with the row alignment and padding its
+    /// optimised (SIMD) scalers may rely on.
+    out: Option<ffmpeg::frame::Video>,
 }
 
 impl Rgba {
@@ -99,6 +114,7 @@ impl Rgba {
         Rgba {
             ctx: std::ptr::null_mut(),
             key: (0, 0, 0, 0, 0),
+            out: None,
         }
     }
 
@@ -141,33 +157,43 @@ impl Rgba {
             self.key = key;
         }
 
-        // The scaler writes opaque RGBA rows straight into the pixel buffer; that is
-        // already valid premultiplied Color32 data.
         let (w, h) = (dw as usize, dh as usize);
-        let mut pixels = vec![Color32::BLACK; w * h];
-        let dst: [*mut u8; 4] = [
-            pixels.as_mut_ptr() as *mut u8, // Color32 is #[repr(C)] [u8; 4]
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ];
-        let dst_stride: [i32; 4] = [(w * 4) as i32, 0, 0, 0];
-        // SAFETY: the context matches the frame's format and size; `dst` holds
-        // exactly dh rows of dw RGBA pixels.
+        let out = match &mut self.out {
+            Some(o) if o.width() == dw && o.height() == dh => o,
+            slot => slot.insert(ffmpeg::frame::Video::new(
+                ffmpeg::format::Pixel::RGBA,
+                dw,
+                dh,
+            )),
+        };
+        // SAFETY: the context matches the frame's format and size, and `out` is an
+        // FFmpeg-allocated dw x dh RGBA frame.
         let rows = unsafe {
             let f = &*frame.as_ptr();
+            let o = &*out.as_ptr();
             ffmpeg::ffi::sws_scale(
                 self.ctx,
                 f.data.as_ptr() as *const *const u8,
                 f.linesize.as_ptr(),
                 0,
                 sh,
-                dst.as_ptr() as _,
-                dst_stride.as_ptr(),
+                o.data.as_ptr() as _,
+                o.linesize.as_ptr(),
             )
         };
         if rows <= 0 {
             return Err("could not convert video frame".into());
+        }
+
+        // Opaque RGBA is already valid premultiplied Color32 data: copy whole rows.
+        let stride = out.stride(0);
+        let data = out.data(0);
+        let mut pixels = vec![Color32::BLACK; w * h];
+        // SAFETY: Color32 is a #[repr(C)] wrapper around [u8; 4].
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, w * h * 4) };
+        for (row, dst) in bytes.chunks_exact_mut(w * 4).enumerate() {
+            dst.copy_from_slice(&data[row * stride..row * stride + w * 4]);
         }
         Ok(ColorImage {
             size: [w, h],
@@ -190,16 +216,22 @@ impl Drop for Rgba {
     }
 }
 
+/// `threaded`: use FFmpeg's multi-threaded decoding (for playback). Thumbnails are
+/// decoded single-threaded, since several are made at once and each decoder thread
+/// holds its own frame buffers (a lot of memory for 4K video).
 fn open_video_decoder(
     stream: &ffmpeg::format::stream::Stream,
+    threaded: bool,
 ) -> Result<ffmpeg::decoder::Video, String> {
     let mut ctx =
         ffmpeg::codec::context::Context::from_parameters(stream.parameters()).map_err(err)?;
-    ctx.set_threading(ffmpeg::codec::threading::Config {
-        kind: ffmpeg::codec::threading::Type::Frame,
-        count: 0,
-        ..Default::default()
-    });
+    if threaded {
+        ctx.set_threading(ffmpeg::codec::threading::Config {
+            kind: ffmpeg::codec::threading::Type::Frame,
+            count: 0,
+            ..Default::default()
+        });
+    }
     ctx.decoder().video().map_err(err)
 }
 
@@ -213,7 +245,7 @@ pub fn thumbnail(path: &Path, max_side: u32) -> Result<ColorImage, String> {
         .ok_or("no video stream")?;
     let index = stream.index();
     let rotation = stream_rotation(&stream);
-    let mut decoder = open_video_decoder(&stream)?;
+    let mut decoder = open_video_decoder(&stream, false)?;
 
     let duration = input.duration();
     if duration > 0 {
@@ -433,8 +465,8 @@ impl Player {
             .ok_or("no video stream")?;
         let rotation = stream_rotation(&vstream);
         let vindex = vstream.index();
-        let vdec = open_video_decoder(&vstream)?;
-        let vtime_base = f64::from(vstream.time_base());
+        let vdec = open_video_decoder(&vstream, true)?;
+        let vtime_base = time_base_secs(vstream.time_base());
 
         let shared = Arc::new(Shared {
             decode: Mutex::new(DecodeState::default()),
@@ -453,7 +485,7 @@ impl Player {
                 if let Some(out) = AudioOut::start(shared.clone()) {
                     adec = Some(AudioDecoder {
                         index: astream.index(),
-                        time_base: f64::from(astream.time_base()),
+                        time_base: time_base_secs(astream.time_base()),
                         decoder: dec,
                         resampler: None,
                         out_rate: out.rate,
@@ -525,14 +557,23 @@ impl Player {
         self.audio.is_some()
     }
     pub fn is_muted(&self) -> bool {
-        self.shared.audio.lock().unwrap().muted
+        self.shared
+            .audio
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .muted
     }
     pub fn error(&self) -> Option<String> {
-        self.shared.decode.lock().unwrap().error.clone()
+        self.shared
+            .decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error
+            .clone()
     }
 
     pub fn toggle_mute(&mut self) {
-        let mut a = self.shared.audio.lock().unwrap();
+        let mut a = self.shared.audio.lock().unwrap_or_else(|e| e.into_inner());
         a.muted = !a.muted;
     }
 
@@ -549,7 +590,11 @@ impl Player {
         self.paused = paused;
         let now = self.clock.now();
         self.clock.set(now, !paused && !self.waiting_first);
-        self.shared.audio.lock().unwrap().paused = paused;
+        self.shared
+            .audio
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .paused = paused;
     }
 
     pub fn seek(&mut self, t: f64) {
@@ -564,7 +609,7 @@ impl Player {
         self.waiting_first = true;
         self.position = t;
         self.clock.set(t, false);
-        let mut st = self.shared.decode.lock().unwrap();
+        let mut st = self.shared.decode.lock().unwrap_or_else(|e| e.into_inner());
         st.seek_to = Some((t, self.serial));
         st.frames.clear();
         drop(st);
@@ -584,7 +629,7 @@ impl Player {
     pub fn update(&mut self, ctx: &egui::Context) -> Duration {
         // Keep the picture clock locked to the audio that is actually being heard.
         if !self.paused && !self.waiting_first && !self.finished && self.audio_sync {
-            let a = self.shared.audio.lock().unwrap();
+            let a = self.shared.audio.lock().unwrap_or_else(|e| e.into_inner());
             if let (Some(base), Some(out)) = (a.base_pts, &self.audio) {
                 if a.consumed == 0 && !a.samples.is_empty() {
                     let since = *self.audio_stalled_since.get_or_insert_with(Instant::now);
@@ -607,7 +652,7 @@ impl Player {
         let mut next_pts = None;
         let eof;
         {
-            let mut st = self.shared.decode.lock().unwrap();
+            let mut st = self.shared.decode.lock().unwrap_or_else(|e| e.into_inner());
             let now = self.clock.now();
             while let Some(front) = st.frames.front() {
                 if front.serial != self.serial {
@@ -648,7 +693,14 @@ impl Player {
         // At the end, start again from the beginning. While paused, wait for play.
         let at_end = eof
             && !self.finished
-            && (self.waiting_first || self.shared.audio.lock().unwrap().samples.is_empty());
+            && (self.waiting_first
+                || self
+                    .shared
+                    .audio
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .samples
+                    .is_empty());
         if at_end && !self.paused {
             if self.texture.is_some() {
                 self.seek(0.0);
@@ -663,7 +715,14 @@ impl Player {
             return Duration::from_millis(250);
         }
         match next_pts {
-            Some(pts) => Duration::from_secs_f64((pts - self.clock.now()).clamp(0.002, 0.1)),
+            Some(pts) => {
+                let wait = pts - self.clock.now();
+                if wait.is_finite() {
+                    Duration::from_secs_f64(wait.clamp(0.002, 0.1))
+                } else {
+                    Duration::from_millis(10)
+                }
+            }
             None => Duration::from_millis(10),
         }
     }
@@ -671,7 +730,11 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        self.shared.decode.lock().unwrap().quit = true;
+        self.shared
+            .decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .quit = true;
         self.shared.wake.notify_all();
     }
 }
@@ -690,7 +753,8 @@ struct AudioDecoder {
     index: usize,
     time_base: f64,
     decoder: ffmpeg::decoder::Audio,
-    resampler: Option<ffmpeg::software::resampling::Context>,
+    /// The resampler and the input (sample format, rate, channels) it was built for.
+    resampler: Option<(ffmpeg::software::resampling::Context, (i32, i32, i32))>,
     out_rate: u32,
     out_channels: u16,
 }
@@ -707,16 +771,36 @@ struct Decoder {
 impl Decoder {
     fn run(mut self) {
         // The scaler is not Send, so it is created here on the decoder thread.
-        let mut rgba = Rgba::new();
-        if let Err(e) = self.run_inner(&mut rgba) {
-            self.shared.decode.lock().unwrap().error = Some(e);
-        }
+        let shared = self.shared.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut rgba = Rgba::new();
+            self.run_inner(&mut rgba)
+        }));
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e,
+            Err(panic) => format!(
+                "the video decoder failed: {}",
+                crate::panic_message(&*panic)
+            ),
+        };
+        shared
+            .decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error = Some(error);
     }
 
     fn audio_buffered(&self) -> f64 {
         match &self.audio {
             Some(a) => {
-                let len = self.shared.audio.lock().unwrap().samples.len();
+                let len = self
+                    .shared
+                    .audio
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .samples
+                    .len();
                 len as f64 / (a.out_rate as f64 * a.out_channels as f64)
             }
             None => f64::INFINITY,
@@ -727,7 +811,7 @@ impl Decoder {
         loop {
             // Handle commands and apply back-pressure.
             let seek = {
-                let mut st = self.shared.decode.lock().unwrap();
+                let mut st = self.shared.decode.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if st.quit {
                         return Ok(());
@@ -735,8 +819,10 @@ impl Decoder {
                     if st.seek_to.is_some() {
                         break st.seek_to.take();
                     }
-                    let full = st.frames.len() >= QUEUE_FRAMES_HARD
-                        || (st.frames.len() >= QUEUE_FRAMES
+                    let frame_bytes = st.frames.front().map_or(0, |f| f.image.pixels.len() * 4);
+                    let hard = (QUEUE_BYTES / frame_bytes.max(1)).clamp(4, QUEUE_FRAMES_HARD);
+                    let full = st.frames.len() >= hard
+                        || (st.frames.len() >= QUEUE_FRAMES.min(hard)
                             && self.audio_buffered() >= AUDIO_AHEAD);
                     if !st.eof && !full {
                         break None;
@@ -746,7 +832,7 @@ impl Decoder {
                         .shared
                         .wake
                         .wait_timeout(st, Duration::from_millis(15))
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .0;
                 }
             };
@@ -777,7 +863,11 @@ impl Decoder {
                         let _ = a.decoder.send_eof();
                         self.drain_audio()?;
                     }
-                    self.shared.decode.lock().unwrap().eof = true;
+                    self.shared
+                        .decode
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .eof = true;
                 }
             }
         }
@@ -792,12 +882,12 @@ impl Decoder {
         }
         self.skip_until = t;
         {
-            let mut a = self.shared.audio.lock().unwrap();
+            let mut a = self.shared.audio.lock().unwrap_or_else(|e| e.into_inner());
             a.samples.clear();
             a.base_pts = None;
             a.consumed = 0;
         }
-        let mut st = self.shared.decode.lock().unwrap();
+        let mut st = self.shared.decode.lock().unwrap_or_else(|e| e.into_inner());
         st.frames.clear();
         st.serial = serial;
         st.eof = false;
@@ -812,7 +902,7 @@ impl Decoder {
             }
             let (dw, dh) = display_size(frame.width(), frame.height(), frame.aspect_ratio());
             let image = rgba.convert(&frame, dw, dh)?;
-            let mut st = self.shared.decode.lock().unwrap();
+            let mut st = self.shared.decode.lock().unwrap_or_else(|e| e.into_inner());
             if st.quit || st.seek_to.is_some() {
                 return Ok(());
             }
@@ -839,25 +929,38 @@ impl Decoder {
                     continue;
                 }
             }
-            if a.resampler.is_none() {
+            // Streams can change format mid-way (e.g. HE-AAC switching between mono
+            // and stereo, or a broadcast going from 5.1 to stereo). The resampler
+            // must match every frame, or it reads channel planes that don't exist.
+            // SAFETY: plain reads of the decoded frame.
+            let key = unsafe {
+                let f = &*frame.as_ptr();
+                (f.format, f.sample_rate, frame.channels() as i32)
+            };
+            if key.1 <= 0 || key.2 <= 0 {
+                continue;
+            }
+            if a.resampler.as_ref().is_none_or(|(_, k)| *k != key) {
+                a.resampler = None;
                 let mut layout = frame.channel_layout();
                 if layout.is_empty() || layout.channels() != frame.channels() as i32 {
                     layout = ffmpeg::ChannelLayout::default(frame.channels() as i32);
                 }
                 let out_layout = ffmpeg::ChannelLayout::default(a.out_channels as i32);
-                a.resampler = Some(
-                    ffmpeg::software::resampling::Context::get(
-                        frame.format(),
-                        layout,
-                        frame.rate(),
-                        ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
-                        out_layout,
-                        a.out_rate,
-                    )
-                    .map_err(err)?,
-                );
+                match ffmpeg::software::resampling::Context::get(
+                    frame.format(),
+                    layout,
+                    frame.rate(),
+                    ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
+                    out_layout,
+                    a.out_rate,
+                ) {
+                    Ok(ctx) => a.resampler = Some((ctx, key)),
+                    // Skip audio we can't convert rather than stop playback.
+                    Err(_) => continue,
+                }
             }
-            let swr = a.resampler.as_mut().unwrap();
+            let (swr, _) = a.resampler.as_mut().unwrap();
             let channels = a.out_channels as usize;
             let samples = unsafe {
                 let cap = ffmpeg::ffi::swr_get_out_samples(swr.as_mut_ptr(), in_samples as i32)
@@ -878,7 +981,7 @@ impl Decoder {
                 buf.truncate(n as usize * channels);
                 buf
             };
-            let mut st = self.shared.audio.lock().unwrap();
+            let mut st = self.shared.audio.lock().unwrap_or_else(|e| e.into_inner());
             if st.base_pts.is_none() {
                 st.base_pts = Some(pts.unwrap_or(self.skip_until).max(self.skip_until));
             }
@@ -924,6 +1027,116 @@ mod tests {
         assert_eq!(r.pixels, vec![px(2), px(1)]);
     }
 
+    /// Runs `ffmpeg` with the given arguments; false when the CLI isn't installed.
+    fn ffmpeg_cli(args: &[&str]) -> bool {
+        std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y"])
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Regression test: audio that changes channel count mid-stream (5.1 then mono)
+    /// used to crash the whole program in the resampler.
+    #[test]
+    fn survives_audio_channel_change() {
+        let dir = std::env::temp_dir().join(format!("liteview-chg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = |name: &str, channels: &str, offset: &str| {
+            let out = dir.join(name);
+            let ok = ffmpeg_cli(&[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=25",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                channels,
+                "-output_ts_offset",
+                offset,
+                "-f",
+                "mpegts",
+                out.to_str().unwrap(),
+            ]);
+            ok.then(|| std::fs::read(out).unwrap())
+        };
+        let (Some(a), Some(b)) = (part("a.ts", "6", "0"), part("b.ts", "1", "1")) else {
+            eprintln!("ffmpeg CLI with libx264 not available; skipping");
+            return;
+        };
+        let clip = dir.join("surround_then_mono.ts");
+        std::fs::write(&clip, [a, b].concat()).unwrap();
+
+        // Drive the decoder thread directly with a fixed stereo output (no sound card).
+        init();
+        let input = ffmpeg::format::input(&clip).unwrap();
+        let vstream = input.streams().best(MediaType::Video).unwrap();
+        let astream = input.streams().best(MediaType::Audio).unwrap();
+        let shared = Arc::new(Shared {
+            decode: Mutex::new(DecodeState::default()),
+            wake: Condvar::new(),
+            audio: Mutex::new(AudioState::default()),
+        });
+        let decoder = Decoder {
+            video: VideoDecoder {
+                index: vstream.index(),
+                time_base: time_base_secs(vstream.time_base()),
+                decoder: open_video_decoder(&vstream, false).unwrap(),
+            },
+            audio: Some(AudioDecoder {
+                index: astream.index(),
+                time_base: time_base_secs(astream.time_base()),
+                decoder: ffmpeg::codec::context::Context::from_parameters(astream.parameters())
+                    .unwrap()
+                    .decoder()
+                    .audio()
+                    .unwrap(),
+                resampler: None,
+                out_rate: 48_000,
+                out_channels: 2,
+            }),
+            input,
+            shared: shared.clone(),
+            skip_until: 0.0,
+        };
+        let thread = std::thread::spawn(move || decoder.run());
+
+        let mut frames = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut st = shared.decode.lock().unwrap();
+            frames += st.frames.drain(..).count();
+            if st.eof || st.error.is_some() || Instant::now() > deadline {
+                assert!(st.error.is_none(), "decoder error: {:?}", st.error);
+                assert!(st.eof, "decoder did not finish");
+                st.quit = true;
+                break;
+            }
+            drop(st);
+            shared.wake.notify_all();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        shared.wake.notify_all();
+        thread.join().unwrap();
+        let samples = shared.audio.lock().unwrap().samples.len();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(frames >= 45, "decoded {frames} video frames");
+        // Two seconds of stereo at 48 kHz: both halves (5.1 and mono) made it through.
+        assert!(samples > 48_000 * 2 * 3 / 2, "only {samples} audio samples");
+    }
+
     #[test]
     fn plays_generated_clip() {
         // Uses the ffmpeg CLI to make a test clip; skipped where it isn't installed.
@@ -953,5 +1166,33 @@ mod tests {
         let player = Player::open(&clip).unwrap();
         assert!((player.duration() - 2.0).abs() < 0.1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+
+    /// Scaling to sizes that aren't multiples of the SIMD width must stay in bounds.
+    #[test]
+    fn converts_to_odd_sizes() {
+        init();
+        let mut src = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, 1920, 1080);
+        for p in 0..3 {
+            src.data_mut(p).fill(128);
+        }
+        let mut rgba = Rgba::new();
+        for (w, h) in [
+            (853, 480),
+            (1279, 719),
+            (101, 57),
+            (3, 2),
+            (1919, 1081),
+            (2, 2),
+        ] {
+            let img = rgba.convert(&src, w, h).unwrap();
+            assert_eq!(img.size, [w as usize, h as usize]);
+            assert_eq!(img.pixels.len(), (w * h) as usize);
+        }
     }
 }
