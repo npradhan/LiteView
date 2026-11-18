@@ -45,22 +45,21 @@ fn install_crash_dialog() {
 
 fn main() -> eframe::Result<()> {
     install_crash_dialog();
-    // A folder (or a single archive/image) may be given on the command line;
-    // otherwise ask the user to pick a folder.
-    let path = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
-        rfd::FileDialog::new()
-            .set_title("LiteView — choose a folder of images and videos")
-            .pick_folder()
-    });
-    let Some(path) = path else {
-        return Ok(());
+    // A folder (or a single archive/image) may be given on the command line; then
+    // open it full screen straight away. Otherwise start with a small window that
+    // has a Load Folder button.
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("LiteView")
+        .with_min_inner_size([320.0, 200.0]);
+    let viewport = if path.is_some() {
+        viewport.with_fullscreen(true)
+    } else {
+        viewport.with_inner_size([420.0, 260.0])
     };
-
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("LiteView")
-            .with_fullscreen(true)
-            .with_min_inner_size([480.0, 320.0]),
+        viewport,
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(

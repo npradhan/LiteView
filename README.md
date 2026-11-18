@@ -4,7 +4,8 @@ A fast, lightweight full-screen image, comic and video viewer written in Rust (e
 
 ## Features
 
-- Pick a folder at start-up (or pass a folder / archive / image path on the command line).
+- Starts with a small window with a **Load Folder** button, then switches to full screen
+  (or pass a folder / archive / image path on the command line to open it straight away).
 - Full-screen viewing, images fitted to the screen.
 - Thumbnail column on the left with the file name under each thumbnail; click one to open it.
   Animated GIF, PNG and WebP images are marked with an **A** badge and videos with a ▶ badge.
@@ -38,9 +39,14 @@ Videos are played from loose files only, not from inside archives.
 | Click a thumbnail | Open that item |
 | Tab | Show / hide the thumbnail column |
 | F11 | Toggle full screen |
-| Right-click → Load Folder… | Open another folder |
-| O | Open another folder |
+| L (or O), or right-click → Load Folder… | Open another folder |
+| Z | Fit-to-width mode for images taller than they are wide (toggle) |
+| ↑ / ↓ (hold), mouse wheel | Scroll up and down a tall image in fit-to-width mode |
 | Esc | Quit (or close the right-click menu) |
+
+Fit-to-width mode (Z) stays on as you move between images; it only changes images that are taller
+than they are wide, and each one starts at the top. In this mode the mouse wheel scrolls the
+image instead of changing pages.
 
 While a video is showing:
 
@@ -121,7 +127,7 @@ cargo build --release
 The program is built to `target/release/liteview` (`liteview.exe` on Windows).
 
 ```bash
-liteview                      # asks for a folder
+liteview                      # start window with a Load Folder button
 liteview ~/Pictures           # opens a folder
 liteview ~/Comics/issue1.cbz  # opens a single archive
 ```

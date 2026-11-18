@@ -61,7 +61,8 @@ struct Animation {
 }
 
 pub struct LiteView {
-    folder: PathBuf,
+    /// The folder being viewed; `None` on the start screen.
+    folder: Option<PathBuf>,
     pages: Arc<Vec<Page>>,
     workers: Workers,
     current: usize,
@@ -77,12 +78,17 @@ pub struct LiteView {
     menu_open: bool,
     /// The player for the current page, when it is a video (or why it failed to open).
     video: Option<(usize, Result<Player, String>)>,
+    /// Z mode: images taller than wide fill the screen width and scroll vertically.
+    fit_width: bool,
+    /// How far down the current image is scrolled in fit-width mode, in points.
+    scroll_y: f32,
 }
 
 impl LiteView {
-    pub fn new(cc: &eframe::CreationContext<'_>, folder: PathBuf) -> Self {
+    /// `folder: None` starts on the small start screen with a Load Folder button.
+    pub fn new(cc: &eframe::CreationContext<'_>, folder: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let pages = Arc::new(source::scan(&folder));
+        let pages = Arc::new(folder.as_deref().map(source::scan).unwrap_or_default());
         let mut app = LiteView {
             workers: Workers::new(pages.clone(), cc.egui_ctx.clone()),
             thumbs: (0..pages.len()).map(|_| Thumb::NotRequested).collect(),
@@ -101,6 +107,8 @@ impl LiteView {
             pick_folder_requested: false,
             menu_open: false,
             video: None,
+            fit_width: false,
+            scroll_y: 0.0,
         };
         app.go_to(&cc.egui_ctx, 0);
         app
@@ -112,7 +120,13 @@ impl LiteView {
         self.workers = Workers::new(pages.clone(), ctx.clone());
         self.thumbs = (0..pages.len()).map(|_| Thumb::NotRequested).collect();
         self.pages = pages;
-        self.folder = folder;
+        if self.folder.is_none() {
+            // Leaving the start screen: switch from the small window to full screen.
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+        }
+        self.folder = Some(folder);
+        self.scroll_y = 0.0;
         self.cache.clear();
         self.video = None;
         self.anim.index = usize::MAX;
@@ -122,9 +136,11 @@ impl LiteView {
 
     /// Ask the user for a new folder and switch to it (no-op if they cancel).
     fn pick_folder(&mut self, ctx: &egui::Context) {
-        let dialog = rfd::FileDialog::new()
-            .set_title("LiteView — choose a folder of images and videos")
-            .set_directory(&self.folder);
+        let mut dialog =
+            rfd::FileDialog::new().set_title("LiteView — choose a folder of images and videos");
+        if let Some(folder) = &self.folder {
+            dialog = dialog.set_directory(folder);
+        }
         if let Some(folder) = dialog.pick_folder() {
             self.open_folder(ctx, folder);
         }
@@ -133,15 +149,18 @@ impl LiteView {
     fn go_to(&mut self, ctx: &egui::Context, index: usize) {
         let n = self.pages.len();
         if n == 0 {
-            ctx.send_viewport_cmd(ViewportCommand::Title(format!(
-                "LiteView — {}",
-                self.folder.display()
-            )));
+            let title = match &self.folder {
+                Some(f) => format!("LiteView — {}", f.display()),
+                None => "LiteView".to_owned(),
+            };
+            ctx.send_viewport_cmd(ViewportCommand::Title(title));
             return;
         }
         let index = index.min(n - 1);
         if index != self.current {
             self.scroll_to_current = true;
+            // Each image starts at the top in fit-width mode.
+            self.scroll_y = 0.0;
         }
         self.current = index;
         // Leaving a video stops it; coming back starts it from the beginning.
@@ -240,7 +259,7 @@ impl LiteView {
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::Tab),
                 i.key_pressed(Key::F11),
-                i.key_pressed(Key::O),
+                i.key_pressed(Key::O) || i.key_pressed(Key::L),
             )
         });
         if esc && !self.menu_open {
@@ -277,6 +296,10 @@ impl LiteView {
         if open {
             self.pick_folder_requested = true;
             return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Z)) {
+            self.fit_width = !self.fit_width;
+            self.scroll_y = 0.0;
         }
         if n == 0 {
             return;
@@ -423,7 +446,10 @@ impl LiteView {
                         }
                         ui.separator();
                     }
-                    if ui.button("Load Folder…").clicked() {
+                    if ui
+                        .add(egui::Button::new("Load Folder…").shortcut_text("L"))
+                        .clicked()
+                    {
                         self.pick_folder_requested = true;
                         ui.close_menu();
                     }
@@ -435,8 +461,8 @@ impl LiteView {
                         area.center(),
                         Align2::CENTER_CENTER,
                         format!(
-                            "No viewable images found in\n{}\n\nPress O to open another folder, Esc to quit.",
-                            self.folder.display()
+                            "No viewable images found in\n{}\n\nPress L to load another folder, Esc to quit.",
+                            self.folder.as_deref().unwrap_or(std::path::Path::new("")).display()
                         ),
                         FontId::proportional(20.0),
                         Color32::from_gray(180),
@@ -444,8 +470,57 @@ impl LiteView {
                     return;
                 }
 
-                // Mouse wheel over the image flips pages.
-                if resp.hovered() {
+                // Z mode applies to images (not videos) taller than they are wide.
+                let index = self.current;
+                let tall = if self.fit_width && self.pages[index].video_path().is_none() {
+                    let size = match (self.cache.get(&index), &self.thumbs[index]) {
+                        (Some(Slot::Loaded(l)), _) => Some(l.frames[0].0.size_vec2()),
+                        (None, Thumb::Ready(tex, _)) => Some(tex.size_vec2()),
+                        _ => None,
+                    };
+                    size.filter(|s| s.y > s.x)
+                } else {
+                    None
+                };
+                // Where the image goes: scrolled at full width, or fitted to the screen.
+                let mut scroll_bar = None;
+                let tall_rect = tall.map(|size| {
+                    let content_h = area.width() * size.y / size.x;
+                    let max_scroll = (content_h - area.height()).max(0.0);
+                    let (wheel, up, down, dt) = ctx.input(|i| {
+                        (
+                            if resp.hovered() { i.smooth_scroll_delta.y } else { 0.0 },
+                            i.key_down(Key::ArrowUp),
+                            i.key_down(Key::ArrowDown),
+                            i.stable_dt.min(0.1),
+                        )
+                    });
+                    let speed = area.height() * 1.5; // points per second while a key is held
+                    self.scroll_y -= wheel * 2.0;
+                    if up {
+                        self.scroll_y -= speed * dt;
+                    }
+                    if down {
+                        self.scroll_y += speed * dt;
+                    }
+                    if up || down {
+                        ctx.request_repaint();
+                    }
+                    self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+                    if max_scroll > 0.0 {
+                        scroll_bar = Some((self.scroll_y / content_h, area.height() / content_h));
+                    }
+                    let top = if max_scroll > 0.0 {
+                        area.top() - self.scroll_y
+                    } else {
+                        area.center().y - content_h / 2.0
+                    };
+                    Rect::from_min_size(pos2(area.left(), top), vec2(area.width(), content_h))
+                });
+                let place = |size: egui::Vec2| tall_rect.unwrap_or_else(|| fit_rect(size, area, true));
+
+                // Mouse wheel over the image flips pages (it scrolls instead in Z mode).
+                if resp.hovered() && tall_rect.is_none() {
                     let dy = ctx.input(|i| i.raw_scroll_delta.y);
                     if dy != 0.0 && self.last_wheel_nav.elapsed() > Duration::from_millis(120) {
                         self.last_wheel_nav = Instant::now();
@@ -461,7 +536,6 @@ impl LiteView {
                     }
                 }
 
-                let index = self.current;
                 let mut info = format!(
                     "{} / {}   {}",
                     index + 1,
@@ -517,7 +591,7 @@ impl LiteView {
                             ctx.request_repaint_after(remaining);
                         }
                         let tex = &loaded.frames[self.anim.frame].0;
-                        let r = fit_rect(tex.size_vec2(), area, true);
+                        let r = place(tex.size_vec2());
                         painter.image(tex.id(), r, unit_uv(), Color32::WHITE);
                         let [w, h] = loaded.original_size;
                         info.push_str(&format!("   {w}×{h}"));
@@ -537,7 +611,7 @@ impl LiteView {
                     None => {
                         // Show the thumbnail as a placeholder while the full image decodes.
                         if let Thumb::Ready(tex, _) = &self.thumbs[index] {
-                            let r = fit_rect(tex.size_vec2(), area, true);
+                            let r = place(tex.size_vec2());
                             painter.image(tex.id(), r, unit_uv(), Color32::from_gray(160));
                         }
                         painter.text(
@@ -550,6 +624,22 @@ impl LiteView {
                     }
                 }
 
+                }
+
+                // Slim scroll indicator on the right in Z mode.
+                if let Some((start, len)) = scroll_bar {
+                    let track = Rect::from_min_max(
+                        pos2(area.right() - 7.0, area.top() + 4.0),
+                        pos2(area.right() - 3.0, area.bottom() - 4.0),
+                    );
+                    let thumb = Rect::from_min_size(
+                        pos2(track.left(), track.top() + track.height() * start),
+                        vec2(track.width(), (track.height() * len).max(16.0)),
+                    );
+                    painter.rect_filled(thumb, 2.0, Color32::from_white_alpha(110));
+                }
+                if self.fit_width {
+                    info.push_str("   fit width (Z)");
                 }
 
                 // Page indicator, bottom-right (above the video controls when shown).
@@ -569,8 +659,48 @@ impl LiteView {
     }
 }
 
+impl LiteView {
+    /// The small window shown at launch: a single Load Folder button.
+    fn start_screen(&mut self, ctx: &egui::Context) {
+        let (open, quit) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::L) || i.key_pressed(Key::O),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if quit {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        if open {
+            self.pick_folder_requested = true;
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let content_h = 120.0;
+            ui.add_space(((ui.available_height() - content_h) / 2.0).max(8.0));
+            ui.vertical_centered(|ui| {
+                ui.heading("LiteView");
+                ui.add_space(4.0);
+                ui.label("Images, comics and videos");
+                ui.add_space(18.0);
+                let button = egui::Button::new(egui::RichText::new("Load Folder…").size(18.0))
+                    .min_size(vec2(180.0, 42.0));
+                if ui.add(button).clicked() {
+                    self.pick_folder_requested = true;
+                }
+            });
+        });
+    }
+}
+
 impl eframe::App for LiteView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.folder.is_none() {
+            self.start_screen(ctx);
+            if std::mem::take(&mut self.pick_folder_requested) {
+                self.pick_folder(ctx);
+            }
+            return;
+        }
         self.receive_results(ctx);
         self.handle_keys(ctx);
         if self.show_sidebar {
